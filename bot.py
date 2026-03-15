@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Claude Code to Claw — Telegram Bot
-支持 Topic 模式（Forum）和普通私聊
-每个 topic/chat 一个独立的 Claude Code session
+支持私聊、私聊 Topic、群组、群组 Forum Topic
+每个 chat/topic 一个独立的 Claude Code session
 """
 
 import asyncio
@@ -34,6 +34,7 @@ logger = logging.getLogger("claw")
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 WORK_DIR = os.environ.get("CLAUDE_WORK_DIR", os.getcwd())
 sessions = SessionManager(base_cwd=WORK_DIR)
+BOT_USERNAME: str = ""  # 启动时从 getMe 获取
 
 
 def _session_key(update: Update) -> str:
@@ -49,88 +50,138 @@ def _session_key(update: Update) -> str:
     return f"tg:{chat_id}"
 
 
+def _extract_text(update: Update) -> str | None:
+    """
+    提取用户消息文本。
+    - 私聊: 直接返回
+    - 群组 forum topic: 直接返回（每个 topic 独立，不需要 @mention）
+    - 群组非 topic: 需要 @mention 或 reply bot，剥离 @username
+    """
+    text = update.message.text
+    if not text:
+        return None
+
+    chat_type = update.effective_chat.type
+
+    # 私聊（包括私聊 topic）: 直接用
+    if chat_type == "private":
+        return text
+
+    # 群组/超级群组
+    topic_id = getattr(update.message, "message_thread_id", None)
+    is_forum = getattr(update.effective_chat, "is_forum", False)
+
+    if is_forum and topic_id:
+        # Forum topic 模式: 每个 topic 是独立对话，不需要 @mention
+        # 剥离可能存在的 @mention（有些用户习惯性 @）
+        return _strip_mention(text)
+
+    # 普通群组: 需要 @mention 或 reply 才响应
+    # 检查是否 reply 了 bot 的消息
+    reply = update.message.reply_to_message
+    if reply and reply.from_user and reply.from_user.username == BOT_USERNAME:
+        return _strip_mention(text)
+
+    # 检查 @mention
+    if BOT_USERNAME and f"@{BOT_USERNAME}" in text:
+        return _strip_mention(text)
+
+    # 普通群消息且没有 @mention → 忽略
+    return None
+
+
+def _strip_mention(text: str) -> str:
+    """去掉消息中的 @bot_username"""
+    if BOT_USERNAME:
+        text = text.replace(f"@{BOT_USERNAME}", "").strip()
+    return text
+
+
+def _make_reply_kwargs(update: Update) -> dict:
+    """构造发送消息的 kwargs（自动处理 topic）"""
+    kwargs = {"chat_id": update.effective_chat.id}
+    topic_id = getattr(update.message, "message_thread_id", None)
+    if topic_id:
+        kwargs["message_thread_id"] = topic_id
+    return kwargs
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理用户消息"""
-    text = update.message.text
+    text = _extract_text(update)
     if not text:
         return
 
-    chat_id = update.effective_chat.id
-    topic_id = getattr(update.message, "message_thread_id", None)
     key = _session_key(update)
+    reply_kwargs = _make_reply_kwargs(update)
     loop = asyncio.get_event_loop()
 
-    logger.info(f"[{key}] 收到: {text[:80]}")
+    # 群组里标注发送者
+    sender = ""
+    chat_type = update.effective_chat.type
+    if chat_type in ("group", "supergroup"):
+        user = update.effective_user
+        sender = f"[{user.first_name or user.username or user.id}] "
 
-    # 回调：Claude 回复时发到 Telegram
+    logger.info(f"[{key}] {sender}收到: {text[:80]}")
+
     def on_response(response_text: str):
         async def _send():
-            # 分段发送（Telegram 单条消息限制 4096 字符）
             for i in range(0, len(response_text), 4000):
                 chunk = response_text[i:i + 4000]
-                kwargs = {"chat_id": chat_id, "text": chunk}
-                if topic_id:
-                    kwargs["message_thread_id"] = topic_id
                 try:
-                    await context.bot.send_message(**kwargs)
+                    await context.bot.send_message(**reply_kwargs, text=chunk)
                 except Exception as e:
                     logger.error(f"发送失败: {e}")
         asyncio.run_coroutine_threadsafe(_send(), loop)
+
+    # 群组里带上发送者信息
+    if sender:
+        text = f"{sender}{text}"
 
     try:
         bridge = sessions.get_or_create(key, on_response=on_response)
         bridge.send(text)
     except RuntimeError as e:
-        kwargs = {"chat_id": chat_id, "text": f"Claude Code 启动失败: {e}"}
-        if topic_id:
-            kwargs["message_thread_id"] = topic_id
-        await context.bot.send_message(**kwargs)
+        await context.bot.send_message(**reply_kwargs, text=f"Claude Code 启动失败: {e}")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    topic_id = getattr(update.message, "message_thread_id", None)
-    kwargs = {
-        "chat_id": chat_id,
-        "text": (
-            "Claude Code to Claw\n\n"
-            "直接发消息即可与 Claude Code 对话。\n"
-            "支持 Topic 模式 — 每个 topic 独立 session。\n\n"
-            "命令:\n"
-            "/start - 显示帮助\n"
-            "/status - 查看当前 session\n"
-            "/reset - 重置当前 session\n"
-            "/attach [session_id] [cwd] - 接管 CLI session\n"
-            "/detach - 分离 session（可在 CLI resume）\n"
-            "/sessions - 列出所有活跃 session"
-        ),
-    }
-    if topic_id:
-        kwargs["message_thread_id"] = topic_id
-    await context.bot.send_message(**kwargs)
+    reply_kwargs = _make_reply_kwargs(update)
+    await context.bot.send_message(**reply_kwargs, text=(
+        "Claude Code to Claw\n\n"
+        "直接发消息即可与 Claude Code 对话。\n\n"
+        "模式:\n"
+        "• 私聊 — 直接发消息\n"
+        "• 私聊 Topic — 每个 topic 独立 session\n"
+        "• 群组 Forum Topic — 每个 topic 独立 session\n"
+        "• 普通群组 — @mention 或 reply bot\n\n"
+        "命令:\n"
+        "/start - 显示帮助\n"
+        "/status - 查看当前 session\n"
+        "/reset - 重置当前 session\n"
+        "/attach [session_id] [cwd] - 接管 CLI session\n"
+        "/detach - 分离 session（可在 CLI resume）\n"
+        "/sessions - 列出所有活跃 session"
+    ))
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """重置当前 session（杀掉进程，下次发消息会新建）"""
     key = _session_key(update)
-    chat_id = update.effective_chat.id
-    topic_id = getattr(update.message, "message_thread_id", None)
+    reply_kwargs = _make_reply_kwargs(update)
 
     with sessions._lock:
         if key in sessions._sessions:
             sessions._sessions[key].stop()
             del sessions._sessions[key]
 
-    kwargs = {"chat_id": chat_id, "text": "Session 已重置。下条消息将创建新 session。"}
-    if topic_id:
-        kwargs["message_thread_id"] = topic_id
-    await context.bot.send_message(**kwargs)
+    await context.bot.send_message(**reply_kwargs, text="Session 已重置。下条消息将创建新 session。")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = _session_key(update)
-    chat_id = update.effective_chat.id
-    topic_id = getattr(update.message, "message_thread_id", None)
+    reply_kwargs = _make_reply_kwargs(update)
 
     with sessions._lock:
         bridge = sessions._sessions.get(key)
@@ -146,27 +197,23 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         status = "无活跃 session。发送消息以创建。"
 
-    kwargs = {"chat_id": chat_id, "text": status}
-    if topic_id:
-        kwargs["message_thread_id"] = topic_id
-    await context.bot.send_message(**kwargs)
+    await context.bot.send_message(**reply_kwargs, text=status)
 
 
 async def cmd_attach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     接管一个 CLI session。
     用法:
+      /attach                        — 列出可用 sessions
       /attach <session_id>           — resume 指定 session
       /attach <session_id> /path/to  — 指定工作目录
     """
-    chat_id = update.effective_chat.id
-    topic_id = getattr(update.message, "message_thread_id", None)
     key = _session_key(update)
+    reply_kwargs = _make_reply_kwargs(update)
     loop = asyncio.get_event_loop()
 
     args = context.args or []
     if not args:
-        # 没参数，列出可用 sessions
         cli_sessions = sessions.list_cli_sessions(limit=10)
         if not cli_sessions:
             text = "没有找到可用的 CLI session。"
@@ -182,15 +229,10 @@ async def cmd_attach(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             lines.append("\n用法: /attach <session_id> [工作目录]")
             text = "\n".join(lines)
-
-        kwargs = {"chat_id": chat_id, "text": text}
-        if topic_id:
-            kwargs["message_thread_id"] = topic_id
-        await context.bot.send_message(**kwargs)
+        await context.bot.send_message(**reply_kwargs, text=text)
         return
 
     session_id = args[0]
-    # 支持短 ID — 前缀匹配
     if len(session_id) < 36:
         cli_sessions = sessions.list_cli_sessions(limit=50)
         matches = [s for s in cli_sessions if s["session_id"].startswith(session_id)]
@@ -201,16 +243,10 @@ async def cmd_attach(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for s in matches[:5]:
                 text += f"  {s['session_id'][:12]}... ({s['project']})\n"
             text += "\n请提供更长的 ID。"
-            kwargs = {"chat_id": chat_id, "text": text}
-            if topic_id:
-                kwargs["message_thread_id"] = topic_id
-            await context.bot.send_message(**kwargs)
+            await context.bot.send_message(**reply_kwargs, text=text)
             return
         elif not matches:
-            kwargs = {"chat_id": chat_id, "text": f"未找到匹配 '{session_id}' 的 session。"}
-            if topic_id:
-                kwargs["message_thread_id"] = topic_id
-            await context.bot.send_message(**kwargs)
+            await context.bot.send_message(**reply_kwargs, text=f"未找到匹配 '{session_id}' 的 session。")
             return
 
     cwd = args[1] if len(args) > 1 else None
@@ -219,11 +255,8 @@ async def cmd_attach(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def _send():
             for i in range(0, len(response_text), 4000):
                 chunk = response_text[i:i + 4000]
-                kwargs = {"chat_id": chat_id, "text": chunk}
-                if topic_id:
-                    kwargs["message_thread_id"] = topic_id
                 try:
-                    await context.bot.send_message(**kwargs)
+                    await context.bot.send_message(**reply_kwargs, text=chunk)
                 except Exception as e:
                     logger.error(f"发送失败: {e}")
         asyncio.run_coroutine_threadsafe(_send(), loop)
@@ -238,18 +271,13 @@ async def cmd_attach(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except RuntimeError as e:
         text = f"接管失败: {e}"
-
-    kwargs = {"chat_id": chat_id, "text": text}
-    if topic_id:
-        kwargs["message_thread_id"] = topic_id
-    await context.bot.send_message(**kwargs)
+    await context.bot.send_message(**reply_kwargs, text=text)
 
 
 async def cmd_detach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """分离当前 session（进程停止，但 session 数据保留，可以在 CLI 里 resume）"""
     key = _session_key(update)
-    chat_id = update.effective_chat.id
-    topic_id = getattr(update.message, "message_thread_id", None)
+    reply_kwargs = _make_reply_kwargs(update)
 
     sid = sessions.detach(key)
     if sid:
@@ -261,17 +289,12 @@ async def cmd_detach(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         text = "当前没有活跃的 session。"
-
-    kwargs = {"chat_id": chat_id, "text": text}
-    if topic_id:
-        kwargs["message_thread_id"] = topic_id
-    await context.bot.send_message(**kwargs)
+    await context.bot.send_message(**reply_kwargs, text=text)
 
 
 async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """列出所有活跃的 bot session"""
-    chat_id = update.effective_chat.id
-    topic_id = getattr(update.message, "message_thread_id", None)
+    reply_kwargs = _make_reply_kwargs(update)
 
     active = sessions.list_sessions()
     if not active:
@@ -287,18 +310,22 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"[{status}{pending}]"
             )
         text = "\n".join(lines)
+    await context.bot.send_message(**reply_kwargs, text=text)
 
-    kwargs = {"chat_id": chat_id, "text": text}
-    if topic_id:
-        kwargs["message_thread_id"] = topic_id
-    await context.bot.send_message(**kwargs)
+
+async def post_init(application):
+    """启动时获取 bot username"""
+    global BOT_USERNAME
+    bot = await application.bot.get_me()
+    BOT_USERNAME = bot.username or ""
+    logger.info(f"Bot username: @{BOT_USERNAME}")
 
 
 def main():
     logger.info(f"工作目录: {WORK_DIR}")
     logger.info("启动 Telegram Bot...")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
