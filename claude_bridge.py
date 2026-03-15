@@ -38,12 +38,16 @@ class ClaudeBridge:
         session_id: str,
         on_response: Callable[[str], None],
         on_turn_complete: Optional[Callable[[], None]] = None,
+        on_busy_changed: Optional[Callable[[bool], None]] = None,
+        on_tool_use: Optional[Callable[[str, dict], None]] = None,
         cwd: Optional[str] = None,
         resume: bool = False,
     ):
         self.session_id = session_id
         self.on_response = on_response
         self.on_turn_complete = on_turn_complete
+        self.on_busy_changed = on_busy_changed  # (is_busy) → typing indicator
+        self.on_tool_use = on_tool_use  # (tool_name, input) → 工具反馈
         self.cwd = cwd or os.getcwd()
 
         self._pending = queue.Queue()
@@ -111,11 +115,19 @@ class ClaudeBridge:
             else:
                 self._send_direct(text)
 
+    def _set_busy(self, busy: bool):
+        self._is_busy = busy
+        if self.on_busy_changed:
+            try:
+                self.on_busy_changed(busy)
+            except Exception as e:
+                logger.debug(f"on_busy_changed error: {e}")
+
     def _send_direct(self, text: str):
         if not self._proc or not self.is_alive:
             logger.error(f"[{self.session_id[:8]}] 进程未运行，无法发送")
             return
-        self._is_busy = True
+        self._set_busy(True)
         self._current_response_parts = []
         try:
             self._proc.stdin.write(_make_msg(text))
@@ -123,7 +135,7 @@ class ClaudeBridge:
             logger.info(f"[{self.session_id[:8]}] → Claude: {text[:80]}")
         except (BrokenPipeError, OSError) as e:
             logger.error(f"[{self.session_id[:8]}] 写入失败: {e}")
-            self._is_busy = False
+            self._set_busy(False)
 
     def _on_turn_done(self):
         """turn 完成后，合并投递 pending 消息"""
@@ -142,7 +154,7 @@ class ClaudeBridge:
                 pass
 
         with self._lock:
-            self._is_busy = False
+            self._set_busy(False)
 
             pending_msgs = []
             while not self._pending.empty():
@@ -174,8 +186,15 @@ class ClaudeBridge:
                 msg_type = msg.get("type", "")
                 if msg_type == "assistant":
                     for block in msg.get("message", {}).get("content", []):
-                        if isinstance(block, dict) and block.get("type") == "text":
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "text":
                             self._current_response_parts.append(block["text"])
+                        elif block.get("type") == "tool_use" and self.on_tool_use:
+                            try:
+                                self.on_tool_use(block.get("name", ""), block.get("input", {}))
+                            except Exception as e:
+                                logger.debug(f"on_tool_use error: {e}")
                 elif msg_type == "result":
                     self._on_turn_done()
         except Exception as e:

@@ -12,6 +12,7 @@ import time
 
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -35,6 +36,12 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 WORK_DIR = os.environ.get("CLAUDE_WORK_DIR", os.getcwd())
 sessions = SessionManager(base_cwd=WORK_DIR)
 BOT_USERNAME: str = ""  # 启动时从 getMe 获取
+
+# 每个 session key 的 verbose 开关（工具反馈）
+_verbose_keys: set[str] = set()
+
+# Typing indicator — 持续发送直到 turn 完成
+_typing_tasks: dict[str, asyncio.Task] = {}
 
 
 def _session_key(update: Update) -> str:
@@ -106,6 +113,40 @@ def _make_reply_kwargs(update: Update) -> dict:
     return kwargs
 
 
+async def _typing_loop(bot, chat_id: int, topic_id: int | None):
+    """持续发送 typing action 直到被 cancel"""
+    try:
+        while True:
+            kwargs = {"chat_id": chat_id, "action": ChatAction.TYPING}
+            if topic_id:
+                kwargs["message_thread_id"] = topic_id
+            await bot.send_chat_action(**kwargs)
+            await asyncio.sleep(4)  # Telegram typing 持续 5 秒，4 秒续一次
+    except asyncio.CancelledError:
+        pass
+
+
+def _tool_summary(name: str, input_data: dict) -> str:
+    """生成工具使用的简短摘要"""
+    if name == "Bash":
+        cmd = input_data.get("command", "")
+        return f"$ {cmd[:80]}"
+    elif name == "Read":
+        return f"读取 {input_data.get('file_path', '?')}"
+    elif name in ("Edit", "FileEdit"):
+        return f"编辑 {input_data.get('file_path', '?')}"
+    elif name in ("Write", "FileWrite"):
+        return f"写入 {input_data.get('file_path', '?')}"
+    elif name == "Glob":
+        return f"搜索 {input_data.get('pattern', '?')}"
+    elif name == "Grep":
+        return f"搜索内容 {input_data.get('pattern', '?')[:40]}"
+    elif name == "Agent":
+        return f"子任务: {input_data.get('description', '?')[:40]}"
+    else:
+        return name
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理用户消息"""
     text = _extract_text(update)
@@ -114,7 +155,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     key = _session_key(update)
     reply_kwargs = _make_reply_kwargs(update)
+    chat_id = update.effective_chat.id
+    topic_id = getattr(update.message, "message_thread_id", None)
     loop = asyncio.get_event_loop()
+    bot = context.bot
+    verbose = key in _verbose_keys
 
     # 群组里标注发送者
     sender = ""
@@ -125,25 +170,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"[{key}] {sender}收到: {text[:80]}")
 
+    # --- 回调 ---
     def on_response(response_text: str):
         async def _send():
+            # 停止 typing
+            task = _typing_tasks.pop(key, None)
+            if task:
+                task.cancel()
             for i in range(0, len(response_text), 4000):
                 chunk = response_text[i:i + 4000]
                 try:
-                    await context.bot.send_message(**reply_kwargs, text=chunk)
+                    await bot.send_message(**reply_kwargs, text=chunk)
                 except Exception as e:
                     logger.error(f"发送失败: {e}")
         asyncio.run_coroutine_threadsafe(_send(), loop)
+
+    def on_busy_changed(is_busy: bool):
+        async def _update():
+            if is_busy:
+                task = asyncio.create_task(_typing_loop(bot, chat_id, topic_id))
+                _typing_tasks[key] = task
+            else:
+                task = _typing_tasks.pop(key, None)
+                if task:
+                    task.cancel()
+        asyncio.run_coroutine_threadsafe(_update(), loop)
+
+    def on_tool_use(tool_name: str, input_data: dict):
+        if not verbose:
+            return
+        summary = _tool_summary(tool_name, input_data)
+        async def _notify():
+            try:
+                await bot.send_message(**reply_kwargs, text=f"🔧 {summary}")
+            except:
+                pass
+        asyncio.run_coroutine_threadsafe(_notify(), loop)
 
     # 群组里带上发送者信息
     if sender:
         text = f"{sender}{text}"
 
     try:
-        bridge = sessions.get_or_create(key, on_response=on_response)
+        bridge = sessions.get_or_create(
+            key,
+            on_response=on_response,
+            on_turn_complete=None,
+        )
+        bridge.on_busy_changed = on_busy_changed
+        bridge.on_tool_use = on_tool_use
         bridge.send(text)
     except RuntimeError as e:
-        await context.bot.send_message(**reply_kwargs, text=f"Claude Code 启动失败: {e}")
+        await bot.send_message(**reply_kwargs, text=f"Claude Code 启动失败: {e}")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -162,7 +240,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/reset - 重置当前 session\n"
         "/attach [session_id] [cwd] - 接管 CLI session\n"
         "/detach - 分离 session（可在 CLI resume）\n"
-        "/sessions - 列出所有活跃 session"
+        "/sessions - 列出所有活跃 session\n"
+        "/verbose - 切换工具反馈（显示 Read/Edit/Bash 等操作）"
     ))
 
 
@@ -313,6 +392,19 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(**reply_kwargs, text=text)
 
 
+async def cmd_verbose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """切换工具反馈开关"""
+    key = _session_key(update)
+    reply_kwargs = _make_reply_kwargs(update)
+
+    if key in _verbose_keys:
+        _verbose_keys.discard(key)
+        await context.bot.send_message(**reply_kwargs, text="工具反馈已关闭。")
+    else:
+        _verbose_keys.add(key)
+        await context.bot.send_message(**reply_kwargs, text="工具反馈已开启。Claude 使用工具时会推送通知。")
+
+
 async def post_init(application):
     """启动时获取 bot username"""
     global BOT_USERNAME
@@ -333,6 +425,7 @@ def main():
     app.add_handler(CommandHandler("attach", cmd_attach))
     app.add_handler(CommandHandler("detach", cmd_detach))
     app.add_handler(CommandHandler("sessions", cmd_sessions))
+    app.add_handler(CommandHandler("verbose", cmd_verbose))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot 已就绪，开始 polling...")
