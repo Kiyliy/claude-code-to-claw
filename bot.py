@@ -8,7 +8,7 @@ Claude Code to Claw — Telegram Bot
 import asyncio
 import logging
 import os
-import html
+import time
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -98,8 +98,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "支持 Topic 模式 — 每个 topic 独立 session。\n\n"
             "命令:\n"
             "/start - 显示帮助\n"
+            "/status - 查看当前 session\n"
             "/reset - 重置当前 session\n"
-            "/status - 查看 session 状态"
+            "/attach [session_id] [cwd] - 接管 CLI session\n"
+            "/detach - 分离 session（可在 CLI resume）\n"
+            "/sessions - 列出所有活跃 session"
         ),
     }
     if topic_id:
@@ -135,13 +138,157 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if bridge and bridge.is_alive:
         status = (
             f"Session: {bridge.session_id[:8]}...\n"
+            f"Full ID: {bridge.session_id}\n"
             f"状态: {'处理中' if bridge._is_busy else '空闲'}\n"
-            f"队列: {bridge._pending.qsize()} 条待处理"
+            f"队列: {bridge._pending.qsize()} 条待处理\n"
+            f"工作目录: {bridge.cwd}"
         )
     else:
         status = "无活跃 session。发送消息以创建。"
 
     kwargs = {"chat_id": chat_id, "text": status}
+    if topic_id:
+        kwargs["message_thread_id"] = topic_id
+    await context.bot.send_message(**kwargs)
+
+
+async def cmd_attach(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    接管一个 CLI session。
+    用法:
+      /attach <session_id>           — resume 指定 session
+      /attach <session_id> /path/to  — 指定工作目录
+    """
+    chat_id = update.effective_chat.id
+    topic_id = getattr(update.message, "message_thread_id", None)
+    key = _session_key(update)
+    loop = asyncio.get_event_loop()
+
+    args = context.args or []
+    if not args:
+        # 没参数，列出可用 sessions
+        cli_sessions = sessions.list_cli_sessions(limit=10)
+        if not cli_sessions:
+            text = "没有找到可用的 CLI session。"
+        else:
+            lines = ["可用的 CLI sessions:\n"]
+            for s in cli_sessions:
+                ts = time.strftime("%m-%d %H:%M", time.localtime(s["modified"]))
+                summary = s["summary"][:40] if s["summary"] else "(空)"
+                lines.append(
+                    f"`{s['session_id'][:8]}` {ts} {s['size_kb']}KB\n"
+                    f"  项目: {s['project']}\n"
+                    f"  最后: {summary}"
+                )
+            lines.append("\n用法: /attach <session_id> [工作目录]")
+            text = "\n".join(lines)
+
+        kwargs = {"chat_id": chat_id, "text": text}
+        if topic_id:
+            kwargs["message_thread_id"] = topic_id
+        await context.bot.send_message(**kwargs)
+        return
+
+    session_id = args[0]
+    # 支持短 ID — 前缀匹配
+    if len(session_id) < 36:
+        cli_sessions = sessions.list_cli_sessions(limit=50)
+        matches = [s for s in cli_sessions if s["session_id"].startswith(session_id)]
+        if len(matches) == 1:
+            session_id = matches[0]["session_id"]
+        elif len(matches) > 1:
+            text = f"多个 session 匹配 '{session_id}':\n"
+            for s in matches[:5]:
+                text += f"  {s['session_id'][:12]}... ({s['project']})\n"
+            text += "\n请提供更长的 ID。"
+            kwargs = {"chat_id": chat_id, "text": text}
+            if topic_id:
+                kwargs["message_thread_id"] = topic_id
+            await context.bot.send_message(**kwargs)
+            return
+        elif not matches:
+            kwargs = {"chat_id": chat_id, "text": f"未找到匹配 '{session_id}' 的 session。"}
+            if topic_id:
+                kwargs["message_thread_id"] = topic_id
+            await context.bot.send_message(**kwargs)
+            return
+
+    cwd = args[1] if len(args) > 1 else None
+
+    def on_response(response_text: str):
+        async def _send():
+            for i in range(0, len(response_text), 4000):
+                chunk = response_text[i:i + 4000]
+                kwargs = {"chat_id": chat_id, "text": chunk}
+                if topic_id:
+                    kwargs["message_thread_id"] = topic_id
+                try:
+                    await context.bot.send_message(**kwargs)
+                except Exception as e:
+                    logger.error(f"发送失败: {e}")
+        asyncio.run_coroutine_threadsafe(_send(), loop)
+
+    try:
+        bridge = sessions.attach(key, session_id, on_response=on_response, cwd=cwd)
+        text = (
+            f"已接管 session: {bridge.session_id[:8]}...\n"
+            f"Full ID: {bridge.session_id}\n"
+            f"工作目录: {bridge.cwd}\n"
+            f"现在可以直接发消息继续对话。"
+        )
+    except RuntimeError as e:
+        text = f"接管失败: {e}"
+
+    kwargs = {"chat_id": chat_id, "text": text}
+    if topic_id:
+        kwargs["message_thread_id"] = topic_id
+    await context.bot.send_message(**kwargs)
+
+
+async def cmd_detach(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """分离当前 session（进程停止，但 session 数据保留，可以在 CLI 里 resume）"""
+    key = _session_key(update)
+    chat_id = update.effective_chat.id
+    topic_id = getattr(update.message, "message_thread_id", None)
+
+    sid = sessions.detach(key)
+    if sid:
+        text = (
+            f"Session 已分离: {sid[:8]}...\n"
+            f"Full ID: {sid}\n"
+            f"你可以在 CLI 里 resume:\n"
+            f"  claude --resume {sid}"
+        )
+    else:
+        text = "当前没有活跃的 session。"
+
+    kwargs = {"chat_id": chat_id, "text": text}
+    if topic_id:
+        kwargs["message_thread_id"] = topic_id
+    await context.bot.send_message(**kwargs)
+
+
+async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """列出所有活跃的 bot session"""
+    chat_id = update.effective_chat.id
+    topic_id = getattr(update.message, "message_thread_id", None)
+
+    active = sessions.list_sessions()
+    if not active:
+        text = "没有活跃的 session。"
+    else:
+        lines = [f"活跃 sessions ({len(active)}):\n"]
+        for s in active:
+            status = "处理中" if s["busy"] else "空闲"
+            pending = f" +{s['pending']}待处理" if s["pending"] else ""
+            lines.append(
+                f"• {s['key']}\n"
+                f"  ID: {s['session_id'][:8]}... "
+                f"[{status}{pending}]"
+            )
+        text = "\n".join(lines)
+
+    kwargs = {"chat_id": chat_id, "text": text}
     if topic_id:
         kwargs["message_thread_id"] = topic_id
     await context.bot.send_message(**kwargs)
@@ -154,8 +301,11 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("attach", cmd_attach))
+    app.add_handler(CommandHandler("detach", cmd_detach))
+    app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot 已就绪，开始 polling...")
