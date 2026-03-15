@@ -42,6 +42,9 @@ class ClaudeBridge:
         on_tool_use: Optional[Callable[[str, dict], None]] = None,
         cwd: Optional[str] = None,
         resume: bool = False,
+        tg_chat_id: str = "",
+        tg_topic_id: str = "",
+        tg_bot_token: str = "",
     ):
         self.session_id = session_id
         self.on_response = on_response
@@ -58,6 +61,34 @@ class ClaudeBridge:
         self._resume = resume
         self._current_response_parts: list[str] = []
 
+        # Telegram MCP context
+        self._tg_chat_id = tg_chat_id
+        self._tg_topic_id = tg_topic_id
+        self._tg_bot_token = tg_bot_token
+
+    def _build_mcp_config(self) -> Optional[str]:
+        """生成 MCP config JSON (注入 Telegram MCP server)"""
+        if not self._tg_bot_token or not self._tg_chat_id:
+            return None
+        mcp_server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_telegram.py")
+        if not os.path.isfile(mcp_server_path):
+            logger.warning(f"MCP server not found: {mcp_server_path}")
+            return None
+        config = {
+            "mcpServers": {
+                "telegram": {
+                    "command": "python3",
+                    "args": [mcp_server_path],
+                    "env": {
+                        "CLAW_BOT_TOKEN": self._tg_bot_token,
+                        "CLAW_CHAT_ID": str(self._tg_chat_id),
+                        "CLAW_TOPIC_ID": str(self._tg_topic_id or ""),
+                    }
+                }
+            }
+        }
+        return json.dumps(config)
+
     def start(self):
         cmd = [
             "claude", "-p",
@@ -72,7 +103,12 @@ class ClaudeBridge:
         else:
             cmd += ["--session-id", self.session_id]
 
-        logger.info(f"Starting Claude Code: {' '.join(cmd)}")
+        # 注入 Telegram MCP
+        mcp_config = self._build_mcp_config()
+        if mcp_config:
+            cmd += ["--mcp-config", mcp_config]
+
+        logger.info(f"Starting Claude Code: {' '.join(cmd[:10])}...")
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -219,8 +255,9 @@ class SessionManager:
     管理多个 ClaudeBridge 实例（每个用户/topic 一个 session）
     """
 
-    def __init__(self, base_cwd: str = None):
+    def __init__(self, base_cwd: str = None, bot_token: str = ""):
         self.base_cwd = base_cwd or os.getcwd()
+        self.bot_token = bot_token
         self._sessions: dict[str, ClaudeBridge] = {}
         self._lock = threading.Lock()
 
@@ -229,22 +266,21 @@ class SessionManager:
         key: str,
         on_response: Callable[[str], None],
         on_turn_complete: Optional[Callable[[], None]] = None,
+        tg_chat_id: str = "",
+        tg_topic_id: str = "",
     ) -> ClaudeBridge:
         with self._lock:
             if key in self._sessions:
                 bridge = self._sessions[key]
                 if bridge.is_alive:
-                    # 更新 callback
                     bridge.on_response = on_response
                     bridge.on_turn_complete = on_turn_complete
                     return bridge
                 else:
-                    # 进程挂了，resume
                     logger.info(f"Session {key} 进程已退出，resume...")
                     bridge.stop()
                     del self._sessions[key]
 
-            # 检查是否有已存在的 session 文件（之前的进程）
             session_id = self._key_to_session_id(key)
             resume = self._session_exists(session_id)
 
@@ -254,9 +290,12 @@ class SessionManager:
                 on_turn_complete=on_turn_complete,
                 cwd=self.base_cwd,
                 resume=resume,
+                tg_chat_id=tg_chat_id,
+                tg_topic_id=tg_topic_id,
+                tg_bot_token=self.bot_token,
             )
             bridge.start()
-            time.sleep(2)  # 等进程初始化
+            time.sleep(2)
 
             if not bridge.is_alive:
                 logger.error(f"Claude Code 进程启动失败 (session {key})")
@@ -276,13 +315,13 @@ class SessionManager:
         on_response: Callable[[str], None],
         on_turn_complete: Optional[Callable[[], None]] = None,
         cwd: Optional[str] = None,
+        tg_chat_id: str = "",
+        tg_topic_id: str = "",
     ) -> ClaudeBridge:
         """
         接管一个已存在的 CLI session（通过 session_id resume）。
-        比如用户在终端 `claude` 里开了个 session，想从 Telegram 继续。
         """
         with self._lock:
-            # 如果这个 key 已有 session，先关掉
             if key in self._sessions:
                 self._sessions[key].stop()
                 del self._sessions[key]
@@ -293,6 +332,9 @@ class SessionManager:
                 on_turn_complete=on_turn_complete,
                 cwd=cwd or self.base_cwd,
                 resume=True,
+                tg_chat_id=tg_chat_id,
+                tg_topic_id=tg_topic_id,
+                tg_bot_token=self.bot_token,
             )
             bridge.start()
             time.sleep(2)
