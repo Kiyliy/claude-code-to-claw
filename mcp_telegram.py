@@ -16,9 +16,15 @@ import urllib.request
 import urllib.parse
 import mimetypes
 
+import time as _time
+import uuid as _uuid
+import threading as _threading
+
 BOT_TOKEN = os.environ.get("CLAW_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CLAW_CHAT_ID", "")
 TOPIC_ID = os.environ.get("CLAW_TOPIC_ID", "")
+SCHEDULE_FILE = os.environ.get("CLAW_SCHEDULE_FILE", os.path.expanduser("~/.claude/claw_schedules.json"))
+SESSION_KEY = os.environ.get("CLAW_SESSION_KEY", "")
 
 TOOLS = [
     {
@@ -27,50 +33,64 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "The message text to send"
-                }
+                "text": {"type": "string", "description": "The message text to send"}
             },
             "required": ["text"]
         }
     },
     {
         "name": "telegram_send_file",
-        "description": "Send a file to the user on Telegram. Use this to share code files, logs, or any document.",
+        "description": "Send a file to the user on Telegram.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Absolute path to the file to send"
-                },
-                "caption": {
-                    "type": "string",
-                    "description": "Optional caption for the file",
-                    "default": ""
-                }
+                "file_path": {"type": "string", "description": "Absolute path to the file"},
+                "caption": {"type": "string", "description": "Optional caption", "default": ""}
             },
             "required": ["file_path"]
         }
     },
     {
         "name": "telegram_send_image",
-        "description": "Send an image to the user on Telegram. Use this to share screenshots, diagrams, or generated images.",
+        "description": "Send an image to the user on Telegram.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Absolute path to the image file (png, jpg, gif, webp)"
-                },
-                "caption": {
-                    "type": "string",
-                    "description": "Optional caption for the image",
-                    "default": ""
-                }
+                "file_path": {"type": "string", "description": "Absolute path to the image (png/jpg/gif/webp)"},
+                "caption": {"type": "string", "description": "Optional caption", "default": ""}
             },
             "required": ["file_path"]
+        }
+    },
+    {
+        "name": "schedule_task",
+        "description": "Schedule a task to be executed later. The prompt will be sent to you (Claude) at the specified time, and your response will be sent to the user on Telegram. Use this when the user says things like '10分钟后提醒我', '2小时后检查一下', '明天早上看看CI'. Supports: delay strings (10m, 2h, 1d, 1h30m) or clock times (15:30, 09:00).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "delay": {"type": "string", "description": "When to trigger: '10m', '2h', '1d', '1h30m', '15:30', '09:00'"},
+                "prompt": {"type": "string", "description": "The task/prompt to execute at that time"}
+            },
+            "required": ["delay", "prompt"]
+        }
+    },
+    {
+        "name": "list_tasks",
+        "description": "List all pending scheduled tasks for this chat.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "cancel_task",
+        "description": "Cancel a scheduled task by its ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "The task ID to cancel"}
+            },
+            "required": ["task_id"]
         }
     },
 ]
@@ -177,10 +197,108 @@ def handle_send_image(args: dict) -> str:
     return f"Image sent: {filename} (id: {result.get('result', {}).get('message_id', '?')})"
 
 
+def _parse_delay(s: str) -> int | None:
+    """Parse delay: 10m, 2h, 1d, 1h30m, 15:30, 09:00"""
+    import re
+    from datetime import datetime
+    s = s.strip().lower()
+    # Clock time HH:MM
+    tm = re.match(r'^(\d{1,2}):(\d{2})$', s)
+    if tm:
+        h, m = int(tm.group(1)), int(tm.group(2))
+        now = datetime.now()
+        target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if target <= now:
+            from datetime import timedelta
+            target += timedelta(days=1)
+        return int((target - now).total_seconds())
+    # Duration
+    p = re.compile(r'^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$')
+    m = p.match(s)
+    if m and any(m.groups()):
+        d, h, mi, sec = (int(x or 0) for x in m.groups())
+        total = d * 86400 + h * 3600 + mi * 60 + sec
+        return total if total > 0 else None
+    if s.isdigit():
+        return int(s) * 60
+    return None
+
+
+def _load_schedules() -> list:
+    if not os.path.isfile(SCHEDULE_FILE):
+        return []
+    try:
+        with open(SCHEDULE_FILE) as f:
+            return json.load(f)
+    except:
+        return []
+
+
+def _save_schedules(data: list):
+    os.makedirs(os.path.dirname(SCHEDULE_FILE), exist_ok=True)
+    with open(SCHEDULE_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def handle_schedule_task(args: dict) -> str:
+    delay_str = args["delay"]
+    prompt = args["prompt"]
+
+    delay = _parse_delay(delay_str)
+    if not delay:
+        return f"Error: cannot parse delay '{delay_str}'. Use: 10m, 2h, 1d, 1h30m, 15:30"
+
+    trigger_at = _time.time() + delay
+    job_id = _uuid.uuid4().hex[:6]
+
+    jobs = _load_schedules()
+    jobs.append({
+        "id": job_id,
+        "session_key": SESSION_KEY,
+        "chat_id": CHAT_ID,
+        "topic_id": TOPIC_ID,
+        "prompt": prompt,
+        "trigger_at": trigger_at,
+    })
+    _save_schedules(jobs)
+
+    trigger_time = _time.strftime("%H:%M", _time.localtime(trigger_at))
+    mins = delay // 60
+    return f"Scheduled: [{job_id}] in {mins}min (at {trigger_time}) → {prompt}"
+
+
+def handle_list_tasks(args: dict) -> str:
+    jobs = _load_schedules()
+    now = _time.time()
+    # Filter to this session and not expired
+    mine = [j for j in jobs if j.get("session_key") == SESSION_KEY and j["trigger_at"] > now]
+    if not mine:
+        return "No pending tasks."
+    lines = []
+    for j in mine:
+        remaining = int(j["trigger_at"] - now) // 60
+        t = _time.strftime("%H:%M", _time.localtime(j["trigger_at"]))
+        lines.append(f"[{j['id']}] {t} (in {remaining}min) → {j['prompt'][:50]}")
+    return "\n".join(lines)
+
+
+def handle_cancel_task(args: dict) -> str:
+    task_id = args["task_id"]
+    jobs = _load_schedules()
+    new_jobs = [j for j in jobs if j.get("id") != task_id]
+    if len(new_jobs) == len(jobs):
+        return f"Task {task_id} not found."
+    _save_schedules(new_jobs)
+    return f"Task {task_id} cancelled."
+
+
 HANDLERS = {
     "telegram_send_message": handle_send_message,
     "telegram_send_file": handle_send_file,
     "telegram_send_image": handle_send_image,
+    "schedule_task": handle_schedule_task,
+    "list_tasks": handle_list_tasks,
+    "cancel_task": handle_cancel_task,
 }
 
 

@@ -83,6 +83,7 @@ class ClaudeBridge:
                         "CLAW_BOT_TOKEN": self._tg_bot_token,
                         "CLAW_CHAT_ID": str(self._tg_chat_id),
                         "CLAW_TOPIC_ID": str(self._tg_topic_id or ""),
+                        "CLAW_SESSION_KEY": f"tg:{self._tg_chat_id}" + (f":{self._tg_topic_id}" if self._tg_topic_id else ""),
                     }
                 }
             }

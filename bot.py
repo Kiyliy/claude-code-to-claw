@@ -22,7 +22,7 @@ from telegram.ext import (
 )
 
 from claude_bridge import SessionManager
-from cron_manager import CronManager
+from scheduler import Scheduler
 
 load_dotenv()
 
@@ -36,7 +36,7 @@ logger = logging.getLogger("claw")
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 WORK_DIR = os.environ.get("CLAUDE_WORK_DIR", os.getcwd())
 sessions = SessionManager(base_cwd=WORK_DIR, bot_token=TOKEN)
-cron_mgr = CronManager()
+scheduler = Scheduler()
 BOT_USERNAME: str = ""  # 启动时从 getMe 获取
 _bot_instance = None  # 存 bot 实例，给 cron 回调用
 
@@ -246,8 +246,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/attach [session_id] [cwd] - 接管 CLI session\n"
         "/detach - 分离 session（可在 CLI resume）\n"
         "/sessions - 列出所有活跃 session\n"
-        "/verbose - 切换工具反馈（显示 Read/Edit/Bash 等操作）\n"
-        "/cron add|list|del - 定时任务管理"
+        "/verbose - 切换工具反馈（显示 Read/Edit/Bash 等操作）\n\n"
+        "定时任务直接说就行:\n"
+        "  \"10分钟后提醒我开会\"\n"
+        "  \"2小时后检查部署结果\""
     ))
 
 
@@ -398,78 +400,6 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(**reply_kwargs, text=text)
 
 
-async def cmd_cron(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    定时任务管理。
-    /cron add <cron_expr> <prompt>  — 添加定时任务
-    /cron list                      — 列出任务
-    /cron del <id>                  — 删除任务
-    示例: /cron add 0 9 * * * 检查 staging 日志有没有报错
-    """
-    key = _session_key(update)
-    reply_kwargs = _make_reply_kwargs(update)
-    chat_id = str(update.effective_chat.id)
-    topic_id = str(getattr(update.message, "message_thread_id", None) or "")
-    args = context.args or []
-
-    if not args or args[0] == "list":
-        jobs = cron_mgr.list_jobs(session_key=key)
-        if not jobs:
-            await context.bot.send_message(**reply_kwargs, text="没有定时任务。\n\n用法: /cron add <cron表达式> <提示词>\n示例: /cron add 0 9 * * * 检查日志")
-            return
-        lines = ["定时任务:\n"]
-        for j in jobs:
-            status = "✓" if j.enabled else "✗"
-            lines.append(f"{status} [{j.id}] `{j.cron_expr}` → {j.prompt[:40]}")
-        lines.append("\n删除: /cron del <id>")
-        await context.bot.send_message(**reply_kwargs, text="\n".join(lines))
-        return
-
-    if args[0] == "del" and len(args) >= 2:
-        job = cron_mgr.remove(args[1])
-        if job:
-            await context.bot.send_message(**reply_kwargs, text=f"已删除: [{job.id}] {job.prompt[:40]}")
-        else:
-            await context.bot.send_message(**reply_kwargs, text=f"未找到任务 {args[1]}")
-        return
-
-    if args[0] == "add" and len(args) >= 7:
-        # /cron add 0 9 * * * 检查日志
-        # args: ["add", "0", "9", "*", "*", "*", "检查日志", ...]
-        cron_expr = " ".join(args[1:6])
-        prompt = " ".join(args[6:])
-        try:
-            job = cron_mgr.add(
-                session_key=key,
-                chat_id=chat_id,
-                topic_id=topic_id,
-                cron_expr=cron_expr,
-                prompt=prompt,
-                cwd=WORK_DIR,
-            )
-            await context.bot.send_message(**reply_kwargs, text=(
-                f"定时任务已添加:\n"
-                f"  ID: {job.id}\n"
-                f"  Cron: {job.cron_expr}\n"
-                f"  任务: {job.prompt}\n\n"
-                f"查看: /cron list\n"
-                f"删除: /cron del {job.id}"
-            ))
-        except ValueError as e:
-            await context.bot.send_message(**reply_kwargs, text=str(e))
-        return
-
-    await context.bot.send_message(**reply_kwargs, text=(
-        "用法:\n"
-        "/cron add <分 时 日 月 周> <提示词>\n"
-        "/cron list\n"
-        "/cron del <id>\n\n"
-        "示例:\n"
-        "/cron add 0 9 * * * 检查 staging 有没有报错\n"
-        "/cron add */30 * * * * 看看 CI 跑完没"
-    ))
-
-
 async def cmd_verbose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """切换工具反馈开关"""
     key = _session_key(update)
@@ -491,22 +421,21 @@ async def post_init(application):
     _bot_instance = application.bot
     logger.info(f"Bot username: @{BOT_USERNAME}")
 
-    # 启动 cron，设置触发回调
+    # 启动 scheduler
     loop = asyncio.get_event_loop()
 
-    def on_cron_trigger(job):
-        """cron 到点 → 发消息给 Claude Code session"""
-        logger.info(f"Cron triggered: [{job.id}] {job.prompt[:50]}")
+    def on_job_trigger(job):
+        logger.info(f"Job triggered: [{job.id}] {job.prompt[:50]}")
 
         def on_response(response_text: str):
             async def _send():
-                kwargs = {"chat_id": int(job.chat_id), "text": f"⏰ [{job.id}] 定时任务结果:\n\n{response_text[:3900]}"}
+                kwargs = {"chat_id": int(job.chat_id), "text": f"⏰ {response_text[:3900]}"}
                 if job.topic_id:
                     kwargs["message_thread_id"] = int(job.topic_id)
                 try:
                     await _bot_instance.send_message(**kwargs)
                 except Exception as e:
-                    logger.error(f"Cron response send failed: {e}")
+                    logger.error(f"Job response send failed: {e}")
             asyncio.run_coroutine_threadsafe(_send(), loop)
 
         try:
@@ -518,10 +447,10 @@ async def post_init(application):
             )
             bridge.send(job.prompt)
         except Exception as e:
-            logger.error(f"Cron execution failed [{job.id}]: {e}")
+            logger.error(f"Job execution failed [{job.id}]: {e}")
 
-    cron_mgr.set_trigger(on_cron_trigger)
-    cron_mgr.start()
+    scheduler.set_trigger(on_job_trigger)
+    scheduler.start()
 
 
 def main():
@@ -537,7 +466,6 @@ def main():
     app.add_handler(CommandHandler("detach", cmd_detach))
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("verbose", cmd_verbose))
-    app.add_handler(CommandHandler("cron", cmd_cron))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot 已就绪，开始 polling...")
