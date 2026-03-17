@@ -16,6 +16,7 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 CLAUDE_SETTINGS_FILE = os.path.expanduser("~/.claude/settings.json")
+RELOAD_SIGNAL_FILE = os.path.expanduser("~/.claude/claw_reload_signal")
 
 
 def _make_msg(text: str) -> bytes:
@@ -77,13 +78,26 @@ class ClaudeBridge:
             return 0
 
     def _check_mcp_changed(self) -> bool:
-        """检查 settings.json 是否被修改过（Claude 可能添加了新 MCP）"""
+        """检查是否需要重启：settings.json 变了，或 Claude 主动请求了 reload"""
+        # 信号文件 (Claude 调用 request_reload 产生)
+        if os.path.isfile(RELOAD_SIGNAL_FILE):
+            return True
+        # settings.json 修改时间变了
         current = self._get_settings_mtime()
         return current != self._settings_mtime
 
     def _reload(self):
         """重启 Claude Code 进程以加载新 MCP"""
-        logger.info(f"[{self.session_id[:8]}] 检测到 settings.json 变化，重启进程加载新 MCP...")
+        # 读取 reload 原因
+        reason = ""
+        if os.path.isfile(RELOAD_SIGNAL_FILE):
+            try:
+                with open(RELOAD_SIGNAL_FILE) as f:
+                    reason = f.read().strip()
+                os.remove(RELOAD_SIGNAL_FILE)
+            except OSError:
+                pass
+        logger.info(f"[{self.session_id[:8]}] 重启进程加载新 MCP{f' ({reason})' if reason else ''}...")
         self.stop()
         self._resume = True  # 重启后 resume 保持上下文
         self._settings_mtime = self._get_settings_mtime()
@@ -96,13 +110,21 @@ class ClaudeBridge:
             logger.error(f"[{self.session_id[:8]}] 重启失败")
 
     def _build_mcp_config(self) -> Optional[str]:
-        """生成 MCP config JSON (平台 MCP + 自定义 MCP)"""
+        """生成 MCP config JSON (reload MCP + 平台 MCP)"""
         config = {"mcpServers": {}}
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # --- Reload MCP (始终注入) ---
+        reload_path = os.path.join(base_dir, "mcp_reload.py")
+        if os.path.isfile(reload_path):
+            config["mcpServers"]["reload"] = {
+                "command": "python3",
+                "args": [reload_path],
+            }
 
         # --- 平台 MCP ---
         if self._mcp_env:
             platform = self._mcp_env.get("platform", "")
-            base_dir = os.path.dirname(os.path.abspath(__file__))
             session_key = self._mcp_env.get("session_key", "")
 
             if platform == "telegram":
