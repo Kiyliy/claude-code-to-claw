@@ -385,7 +385,7 @@ def _build_tools() -> list:
     tools = [
         {
             "name": "feishu_send_message",
-            "description": "Send a text message to Feishu (飞书). Use this to proactively notify the user about results, errors, or status updates.",
+            "description": "Send a text message to the current Feishu (飞书) chat where you received the user's message. No need to specify a recipient — it automatically goes to the same chat. Use this to proactively notify the user about results, errors, or status updates.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -396,7 +396,7 @@ def _build_tools() -> list:
         },
         {
             "name": "feishu_send_rich_message",
-            "description": "Send a rich text message to Feishu (飞书) with a title and multi-line content.",
+            "description": "Send a rich text message to the current Feishu (飞书) chat with a title and multi-line content. Automatically sent to the same chat where you received the user's message.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -408,7 +408,7 @@ def _build_tools() -> list:
         },
         {
             "name": "feishu_send_card",
-            "description": "Send an interactive card message to Feishu (飞书). Supports markdown content with a colored header. Best for structured reports, status updates, or formatted notifications.",
+            "description": "Send an interactive card message to the current Feishu (飞书) chat. Supports markdown content with a colored header. Best for structured reports, status updates, or formatted notifications. Automatically sent to the same chat.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -425,7 +425,7 @@ def _build_tools() -> list:
         tools.extend([
             {
                 "name": "feishu_send_image",
-                "description": "Send an image to Feishu (飞书). Requires App API mode.",
+                "description": "Send an image to the current Feishu (飞书) chat. The image is uploaded and delivered to the same chat where you received the user's message. Use this to send screenshots, diagrams, etc.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -437,7 +437,7 @@ def _build_tools() -> list:
             },
             {
                 "name": "feishu_send_file",
-                "description": "Send a file to Feishu (飞书). Requires App API mode.",
+                "description": "Send a file to the current Feishu (飞书) chat. Automatically sent to the same chat where you received the user's message.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

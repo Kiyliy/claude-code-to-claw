@@ -29,7 +29,7 @@ SESSION_KEY = os.environ.get("CLAW_SESSION_KEY", "")
 TOOLS = [
     {
         "name": "telegram_send_message",
-        "description": "Send a text message to the user on Telegram. Use this to proactively notify the user about results, errors, or status updates.",
+        "description": "Send a text message to the current Telegram chat where you received the user's message. No need to specify a recipient. Use this to proactively notify the user about results, errors, or status updates.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -40,7 +40,7 @@ TOOLS = [
     },
     {
         "name": "telegram_send_file",
-        "description": "Send a file to the user on Telegram.",
+        "description": "Send a file to the current Telegram chat. Automatically sent to the same chat where you received the user's message.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -52,7 +52,7 @@ TOOLS = [
     },
     {
         "name": "telegram_send_image",
-        "description": "Send an image to the user on Telegram.",
+        "description": "Send an image to the current Telegram chat. Automatically sent to the same chat where you received the user's message.",
         "inputSchema": {
             "type": "object",
             "properties": {
