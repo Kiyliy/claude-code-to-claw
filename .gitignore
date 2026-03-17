@@ -4,4 +4,4 @@ __pycache__/
 *.session
 *.pickle
 .venv/
-assets/
+claude_assets/

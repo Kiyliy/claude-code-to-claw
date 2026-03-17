@@ -4,12 +4,12 @@ description: "管理 Agent 资产（API keys、凭证、配置文件、生成物
 
 # Agent 资产管理
 
-你是一个资产管理助手。Agent 的所有资产统一存放在工作目录下的 `assets/` 文件夹中。
+你是一个资产管理助手。Agent 的所有资产统一存放在工作目录下的 `claude_assets/` 文件夹中。
 
 ## 目录结构约定
 
 ```
-assets/
+claude_assets/
 ├── keys/           # API keys、tokens、secrets
 ├── credentials/    # 账号密码、OAuth 凭证
 ├── configs/        # 配置文件（非代码配置）
@@ -21,10 +21,10 @@ assets/
 ## 操作规范
 
 ### 初始化
-如果 `assets/` 目录不存在，先创建完整目录结构，并确保 `.gitignore` 中包含 `assets/`。
+如果 `claude_assets/` 目录不存在，先创建完整目录结构，并确保 `.gitignore` 中包含 `claude_assets/`。
 
 ### inventory.json 格式
-每次增删资产时，同步更新 `assets/inventory.json`：
+每次增删资产时，同步更新 `claude_assets/inventory.json`：
 ```json
 {
   "assets": [
@@ -32,7 +32,7 @@ assets/
       "id": "唯一标识",
       "type": "key | credential | config | download | generated",
       "name": "资产名称",
-      "path": "相对于 assets/ 的路径",
+      "path": "相对于 claude_assets/ 的路径",
       "description": "用途说明",
       "created_at": "ISO 时间",
       "expires_at": "过期时间（可选）"
@@ -54,7 +54,7 @@ assets/
 2. 从 inventory.json 中移除记录
 
 ### 安全规则
-- **绝不**将 assets/ 下的内容输出到聊天中（尤其是 keys 和 credentials）
+- **绝不**将 claude_assets/ 下的内容输出到聊天中（尤其是 keys 和 credentials）
 - 引用资产时只说"已使用 [资产名称]"，不暴露具体值
 - 敏感文件使用 chmod 600
 
