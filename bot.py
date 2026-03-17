@@ -35,7 +35,7 @@ logger = logging.getLogger("claw")
 # --- 全局 ---
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 WORK_DIR = os.environ.get("CLAUDE_WORK_DIR", os.getcwd())
-sessions = SessionManager(base_cwd=WORK_DIR, bot_token=TOKEN)
+sessions = SessionManager(base_cwd=WORK_DIR)
 scheduler = Scheduler()
 BOT_USERNAME: str = ""  # 启动时从 getMe 获取
 _bot_instance = None  # 存 bot 实例，给 cron 回调用
@@ -214,13 +214,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sender:
         text = f"{sender}{text}"
 
+    mcp_env = {
+        "platform": "telegram",
+        "bot_token": TOKEN,
+        "chat_id": str(chat_id),
+        "topic_id": str(topic_id or ""),
+        "session_key": key,
+    }
+
     try:
         bridge = sessions.get_or_create(
             key,
             on_response=on_response,
             on_turn_complete=None,
-            tg_chat_id=str(chat_id),
-            tg_topic_id=str(topic_id or ""),
+            mcp_env=mcp_env,
         )
         bridge.on_busy_changed = on_busy_changed
         bridge.on_tool_use = on_tool_use
@@ -439,11 +446,17 @@ async def post_init(application):
             asyncio.run_coroutine_threadsafe(_send(), loop)
 
         try:
+            job_mcp_env = {
+                "platform": "telegram",
+                "bot_token": TOKEN,
+                "chat_id": job.chat_id,
+                "topic_id": job.topic_id,
+                "session_key": job.session_key,
+            }
             bridge = sessions.get_or_create(
                 job.session_key,
                 on_response=on_response,
-                tg_chat_id=job.chat_id,
-                tg_topic_id=job.topic_id,
+                mcp_env=job_mcp_env,
             )
             bridge.send(job.prompt)
         except Exception as e:

@@ -42,9 +42,7 @@ class ClaudeBridge:
         on_tool_use: Optional[Callable[[str, dict], None]] = None,
         cwd: Optional[str] = None,
         resume: bool = False,
-        tg_chat_id: str = "",
-        tg_topic_id: str = "",
-        tg_bot_token: str = "",
+        mcp_env: Optional[dict] = None,
     ):
         self.session_id = session_id
         self.on_response = on_response
@@ -61,33 +59,63 @@ class ClaudeBridge:
         self._resume = resume
         self._current_response_parts: list[str] = []
 
-        # Telegram MCP context
-        self._tg_chat_id = tg_chat_id
-        self._tg_topic_id = tg_topic_id
-        self._tg_bot_token = tg_bot_token
+        # MCP 配置 (平台无关)
+        self._mcp_env = mcp_env  # {"platform": "telegram"|"feishu", ...平台参数}
 
     def _build_mcp_config(self) -> Optional[str]:
-        """生成 MCP config JSON (注入 Telegram MCP server)"""
-        if not self._tg_bot_token or not self._tg_chat_id:
+        """生成 MCP config JSON (根据 mcp_env 注入对应平台的 MCP server)"""
+        if not self._mcp_env:
             return None
-        mcp_server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_telegram.py")
-        if not os.path.isfile(mcp_server_path):
-            logger.warning(f"MCP server not found: {mcp_server_path}")
-            return None
-        config = {
-            "mcpServers": {
-                "telegram": {
-                    "command": "python3",
-                    "args": [mcp_server_path],
-                    "env": {
-                        "CLAW_BOT_TOKEN": self._tg_bot_token,
-                        "CLAW_CHAT_ID": str(self._tg_chat_id),
-                        "CLAW_TOPIC_ID": str(self._tg_topic_id or ""),
-                        "CLAW_SESSION_KEY": f"tg:{self._tg_chat_id}" + (f":{self._tg_topic_id}" if self._tg_topic_id else ""),
+
+        platform = self._mcp_env.get("platform", "")
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        session_key = self._mcp_env.get("session_key", "")
+
+        if platform == "telegram":
+            mcp_server_path = os.path.join(base_dir, "mcp_telegram.py")
+            if not os.path.isfile(mcp_server_path):
+                logger.warning(f"MCP server not found: {mcp_server_path}")
+                return None
+            config = {
+                "mcpServers": {
+                    "telegram": {
+                        "command": "python3",
+                        "args": [mcp_server_path],
+                        "env": {
+                            "CLAW_BOT_TOKEN": self._mcp_env.get("bot_token", ""),
+                            "CLAW_CHAT_ID": self._mcp_env.get("chat_id", ""),
+                            "CLAW_TOPIC_ID": self._mcp_env.get("topic_id", ""),
+                            "CLAW_SESSION_KEY": session_key,
+                        }
                     }
                 }
             }
-        }
+        elif platform == "feishu":
+            mcp_server_path = os.path.join(base_dir, "mcp_feishu.py")
+            if not os.path.isfile(mcp_server_path):
+                logger.warning(f"MCP server not found: {mcp_server_path}")
+                return None
+            env = {"CLAW_SESSION_KEY": session_key}
+            # Webhook 模式
+            if self._mcp_env.get("webhook_url"):
+                env["CLAW_FEISHU_WEBHOOK"] = self._mcp_env["webhook_url"]
+            # App API 模式
+            if self._mcp_env.get("app_id"):
+                env["CLAW_FEISHU_APP_ID"] = self._mcp_env["app_id"]
+                env["CLAW_FEISHU_APP_SECRET"] = self._mcp_env.get("app_secret", "")
+                env["CLAW_FEISHU_CHAT_ID"] = self._mcp_env.get("chat_id", "")
+            config = {
+                "mcpServers": {
+                    "feishu": {
+                        "command": "python3",
+                        "args": [mcp_server_path],
+                        "env": env,
+                    }
+                }
+            }
+        else:
+            return None
+
         return json.dumps(config)
 
     def start(self):
@@ -256,9 +284,9 @@ class SessionManager:
     管理多个 ClaudeBridge 实例（每个用户/topic 一个 session）
     """
 
-    def __init__(self, base_cwd: str = None, bot_token: str = ""):
+    def __init__(self, base_cwd: str = None, mcp_env_factory: Callable = None):
         self.base_cwd = base_cwd or os.getcwd()
-        self.bot_token = bot_token
+        self._mcp_env_factory = mcp_env_factory  # (key, chat_id, ...) → mcp_env dict
         self._sessions: dict[str, ClaudeBridge] = {}
         self._lock = threading.Lock()
 
@@ -267,8 +295,7 @@ class SessionManager:
         key: str,
         on_response: Callable[[str], None],
         on_turn_complete: Optional[Callable[[], None]] = None,
-        tg_chat_id: str = "",
-        tg_topic_id: str = "",
+        mcp_env: Optional[dict] = None,
     ) -> ClaudeBridge:
         with self._lock:
             if key in self._sessions:
@@ -291,9 +318,7 @@ class SessionManager:
                 on_turn_complete=on_turn_complete,
                 cwd=self.base_cwd,
                 resume=resume,
-                tg_chat_id=tg_chat_id,
-                tg_topic_id=tg_topic_id,
-                tg_bot_token=self.bot_token,
+                mcp_env=mcp_env,
             )
             bridge.start()
             time.sleep(2)
@@ -316,8 +341,7 @@ class SessionManager:
         on_response: Callable[[str], None],
         on_turn_complete: Optional[Callable[[], None]] = None,
         cwd: Optional[str] = None,
-        tg_chat_id: str = "",
-        tg_topic_id: str = "",
+        mcp_env: Optional[dict] = None,
     ) -> ClaudeBridge:
         """
         接管一个已存在的 CLI session（通过 session_id resume）。
@@ -333,9 +357,7 @@ class SessionManager:
                 on_turn_complete=on_turn_complete,
                 cwd=cwd or self.base_cwd,
                 resume=True,
-                tg_chat_id=tg_chat_id,
-                tg_topic_id=tg_topic_id,
-                tg_bot_token=self.bot_token,
+                mcp_env=mcp_env,
             )
             bridge.start()
             time.sleep(2)
