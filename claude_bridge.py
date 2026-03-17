@@ -118,6 +118,12 @@ class ClaudeBridge:
                     self.on_response("✅ 已重启，新工具已加载")
                 except:
                     pass
+            # 唤醒 Claude，告知重启完成
+            wake_msg = "系统提示：你刚才请求了进程重启，现在已重启完成，新的 MCP 工具已加载。"
+            if reason:
+                wake_msg += f" 重启原因: {reason}。"
+            wake_msg += " 请继续之前的任务。"
+            self._send_direct(wake_msg)
         else:
             logger.error(f"[{self.session_id[:8]}] 重启失败")
 
