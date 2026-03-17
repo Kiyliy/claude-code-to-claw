@@ -68,10 +68,9 @@
 
 ## 研究结论
 
-### stream-json 模式下 interrupt 不可用
+### ~~stream-json 模式下 interrupt 不可用~~ → 可用！
 
-- **确认**: stream-json 模式下往 stdin 写消息只会排队等下一个 turn，不会触发 interrupt
-- **GitHub Issue #3187**: 确认 headless 模式下第二条 stdin 消息排队，甚至可能 hang
+**更正**：深入分析 cli.js 源码后发现 stream-json 模式**完全支持 interrupt 和 pending message**。
 - **GitHub Issue #29224**: 社区请求 `QueuedMessage` hook 事件，尚未实现
 - **`--replay-user-messages`**: 用于 file checkpointing（回显 user message UUID），跟 interrupt 无关
 - **bridge 模式**: 是 Remote Control（claude.ai 远程控制本地），通过 WebSocket，不适用于我们
@@ -101,8 +100,53 @@ async with ClaudeSDKClient(options=options) as client:
 | Python Agent SDK | ✅ `interrupt()` | 中 | ⭐ 推荐 |
 | 直接用 Anthropic API | ✅ 完全自控 | 高 | 过度 |
 
+### 源码分析：stream-json 下的 interrupt 机制（cli.js 深度分析）
+
+#### 1. control_request interrupt
+
+往 stdin 写以下 JSON 可以立刻中断当前 turn：
+```json
+{"type":"control_request","request_id":"unique-uuid","request":{"subtype":"interrupt"}}
+```
+
+源码路径：`structuredInput` 循环 → 检测 `control_request` → `subtype === "interrupt"` → `W.abort()` 中断 AbortController
+
+#### 2. user message priority 字段
+
+stdin 的 user message 支持 `priority` 字段：
+```json
+{"type":"user","message":{"role":"user","content":"新消息"},"priority":"now"}
+```
+
+- `"now"` (priority 0) — 立刻触发 abort，中断当前 turn
+- `"next"` (priority 1, 默认) — 当前 tool 执行完后在下一轮 API 调用前注入
+- `"later"` (priority 2) — 所有 tool 完成后处理
+
+#### 3. pending 消息处理
+
+在 `gzz` 函数（内部 query 循环）中，tool 执行完成后：
+```js
+let a = $.startsWith("repl_main_thread") || $ === "sdk"
+  ? _Z1(z6 ? "later" : "next")  // 从 Hz 队列取 pending 消息
+  : [];
+```
+
+`$ === "sdk"` 就是 `-p` 模式。所以 **-p 模式本身就支持 pending 消息注入**。
+
+取出的消息通过 `Xf6` 函数转换为 attachment，附加到下一轮 API 调用的上下文中（作为 system-reminder）。
+
+#### 4. 架构关键组件
+
+- `Ve6` 类：stdin IO handler，读 NDJSON，解析分发
+- `Hz` 数组：全局消息队列，支持优先级
+- `HW()` / `zZ1()`：入队/出队函数
+- `eG6()`：队列变化订阅，`priority:"now"` 的消息触发 abort
+- `Da6` 类：工具执行器，每个工具有 `interruptBehavior()`（`"block"` 或 `"cancel"`）
+- `gzz` 函数：内部 query 循环，检查 pending 消息
+
 ### 下一步
 
-1. **短期**: 恢复 pending 队列 + 合并回复作为 workaround
-2. **中期**: 将 claude_bridge.py 重构为使用 Python Agent SDK，获得原生 interrupt 支持
-3. **长期**: 关注 Claude Code 后续版本是否在 stream-json 协议中加入 interrupt 支持
+1. **修改 bridge 的消息格式**：给 stdin 写的 user message 加上 `priority` 字段
+2. **普通消息用 `"next"`**：在工具间隙注入，不打断当前操作
+3. **紧急消息用 `"now"`**：立刻中断（比如用户发了 /reset）
+4. **不需要自己做 pending 队列**：Claude Code 内部的 Hz 队列就是 pending 队列
