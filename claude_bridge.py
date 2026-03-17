@@ -15,6 +15,8 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+CLAUDE_SETTINGS_FILE = os.path.expanduser("~/.claude/settings.json")
+
 
 def _make_msg(text: str) -> bytes:
     return (json.dumps({
@@ -62,23 +64,51 @@ class ClaudeBridge:
         # MCP 配置 (平台无关)
         self._mcp_env = mcp_env  # {"platform": "telegram"|"feishu", ...平台参数}
 
+        # settings.json MCP 热加载
+        self._settings_mtime = self._get_settings_mtime()
+        self._needs_reload = False
+
+    @staticmethod
+    def _get_settings_mtime() -> float:
+        """获取 settings.json 的修改时间"""
+        try:
+            return os.path.getmtime(CLAUDE_SETTINGS_FILE)
+        except OSError:
+            return 0
+
+    def _check_mcp_changed(self) -> bool:
+        """检查 settings.json 是否被修改过（Claude 可能添加了新 MCP）"""
+        current = self._get_settings_mtime()
+        return current != self._settings_mtime
+
+    def _reload(self):
+        """重启 Claude Code 进程以加载新 MCP"""
+        logger.info(f"[{self.session_id[:8]}] 检测到 settings.json 变化，重启进程加载新 MCP...")
+        self.stop()
+        self._resume = True  # 重启后 resume 保持上下文
+        self._settings_mtime = self._get_settings_mtime()
+        self._needs_reload = False
+        self.start()
+        time.sleep(2)
+        if self.is_alive:
+            logger.info(f"[{self.session_id[:8]}] 重启成功，新 MCP 已加载")
+        else:
+            logger.error(f"[{self.session_id[:8]}] 重启失败")
+
     def _build_mcp_config(self) -> Optional[str]:
-        """生成 MCP config JSON (根据 mcp_env 注入对应平台的 MCP server)"""
-        if not self._mcp_env:
-            return None
+        """生成 MCP config JSON (平台 MCP + 自定义 MCP)"""
+        config = {"mcpServers": {}}
 
-        platform = self._mcp_env.get("platform", "")
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        session_key = self._mcp_env.get("session_key", "")
+        # --- 平台 MCP ---
+        if self._mcp_env:
+            platform = self._mcp_env.get("platform", "")
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            session_key = self._mcp_env.get("session_key", "")
 
-        if platform == "telegram":
-            mcp_server_path = os.path.join(base_dir, "mcp_telegram.py")
-            if not os.path.isfile(mcp_server_path):
-                logger.warning(f"MCP server not found: {mcp_server_path}")
-                return None
-            config = {
-                "mcpServers": {
-                    "telegram": {
+            if platform == "telegram":
+                mcp_server_path = os.path.join(base_dir, "mcp_telegram.py")
+                if os.path.isfile(mcp_server_path):
+                    config["mcpServers"]["telegram"] = {
                         "command": "python3",
                         "args": [mcp_server_path],
                         "env": {
@@ -88,34 +118,24 @@ class ClaudeBridge:
                             "CLAW_SESSION_KEY": session_key,
                         }
                     }
-                }
-            }
-        elif platform == "feishu":
-            mcp_server_path = os.path.join(base_dir, "mcp_feishu.py")
-            if not os.path.isfile(mcp_server_path):
-                logger.warning(f"MCP server not found: {mcp_server_path}")
-                return None
-            env = {"CLAW_SESSION_KEY": session_key}
-            # Webhook 模式
-            if self._mcp_env.get("webhook_url"):
-                env["CLAW_FEISHU_WEBHOOK"] = self._mcp_env["webhook_url"]
-            # App API 模式
-            if self._mcp_env.get("app_id"):
-                env["CLAW_FEISHU_APP_ID"] = self._mcp_env["app_id"]
-                env["CLAW_FEISHU_APP_SECRET"] = self._mcp_env.get("app_secret", "")
-                env["CLAW_FEISHU_CHAT_ID"] = self._mcp_env.get("chat_id", "")
-            config = {
-                "mcpServers": {
-                    "feishu": {
+            elif platform == "feishu":
+                mcp_server_path = os.path.join(base_dir, "mcp_feishu.py")
+                if os.path.isfile(mcp_server_path):
+                    env = {"CLAW_SESSION_KEY": session_key}
+                    if self._mcp_env.get("webhook_url"):
+                        env["CLAW_FEISHU_WEBHOOK"] = self._mcp_env["webhook_url"]
+                    if self._mcp_env.get("app_id"):
+                        env["CLAW_FEISHU_APP_ID"] = self._mcp_env["app_id"]
+                        env["CLAW_FEISHU_APP_SECRET"] = self._mcp_env.get("app_secret", "")
+                        env["CLAW_FEISHU_CHAT_ID"] = self._mcp_env.get("chat_id", "")
+                    config["mcpServers"]["feishu"] = {
                         "command": "python3",
                         "args": [mcp_server_path],
                         "env": env,
                     }
-                }
-            }
-        else:
-            return None
 
+        if not config["mcpServers"]:
+            return None
         return json.dumps(config)
 
     def start(self):
@@ -132,7 +152,7 @@ class ClaudeBridge:
         else:
             cmd += ["--session-id", self.session_id]
 
-        # 注入 Telegram MCP
+        # 注入 MCP (平台 + 自定义)
         mcp_config = self._build_mcp_config()
         if mcp_config:
             cmd += ["--mcp-config", mcp_config]
@@ -203,7 +223,7 @@ class ClaudeBridge:
             self._set_busy(False)
 
     def _on_turn_done(self):
-        """turn 完成后，合并投递 pending 消息"""
+        """turn 完成后，检查 MCP 热加载，合并投递 pending 消息"""
         # 先发回复
         full_response = "\n".join(self._current_response_parts)
         if full_response:
@@ -218,8 +238,16 @@ class ClaudeBridge:
             except:
                 pass
 
+        # 检查自定义 MCP 是否有变化
+        if self._check_mcp_changed():
+            self._needs_reload = True
+
         with self._lock:
             self._set_busy(False)
+
+            # 需要重启加载新 MCP → 在发下一条消息前重启
+            if self._needs_reload:
+                self._reload()
 
             pending_msgs = []
             while not self._pending.empty():
