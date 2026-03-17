@@ -97,7 +97,14 @@ class ClaudeBridge:
                 os.remove(RELOAD_SIGNAL_FILE)
             except OSError:
                 pass
-        logger.info(f"[{self.session_id[:8]}] 重启进程加载新 MCP{f' ({reason})' if reason else ''}...")
+        msg = f"🔄 Claude 正在重启以加载新工具{f': {reason}' if reason else ''}..."
+        logger.info(f"[{self.session_id[:8]}] {msg}")
+        # 通知用户
+        if self.on_response:
+            try:
+                self.on_response(msg)
+            except:
+                pass
         self.stop()
         self._resume = True  # 重启后 resume 保持上下文
         self._settings_mtime = self._get_settings_mtime()
@@ -106,6 +113,11 @@ class ClaudeBridge:
         time.sleep(2)
         if self.is_alive:
             logger.info(f"[{self.session_id[:8]}] 重启成功，新 MCP 已加载")
+            if self.on_response:
+                try:
+                    self.on_response("✅ 已重启，新工具已加载")
+                except:
+                    pass
         else:
             logger.error(f"[{self.session_id[:8]}] 重启失败")
 
