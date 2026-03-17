@@ -308,8 +308,15 @@ def _start_scheduler():
 
 
 def main():
+    import sys
+    debug = "--debug" in sys.argv
+    if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger("claude_bridge").setLevel(logging.DEBUG)
+
     logger.info(f"工作目录: {WORK_DIR}")
-    logger.info("启动 Feishu Bot...")
+    logger.info(f"启动 Feishu Bot... (debug={debug})")
 
     if not APP_ID or not APP_SECRET:
         logger.error("请设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
@@ -323,11 +330,12 @@ def main():
         .register_p2_im_message_receive_v1(on_message) \
         .build()
 
+    lark_log_level = lark.LogLevel.DEBUG if debug else lark.LogLevel.INFO
     client = lark.ws.Client(
         app_id=APP_ID,
         app_secret=APP_SECRET,
         event_handler=handler,
-        log_level=lark.LogLevel.INFO,
+        log_level=lark_log_level,
     )
 
     logger.info("WebSocket 长连接启动中...")

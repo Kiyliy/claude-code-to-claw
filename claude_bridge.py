@@ -197,6 +197,10 @@ class ClaudeBridge:
         if mcp_config:
             cmd += ["--mcp-config", mcp_config]
 
+        # 安全检查：确保同一个 session_id 没有残留进程
+        self._kill_stale_processes()
+
+        logger.debug(f"[{self.session_id[:8]}] start() 启动进程, resume={self._resume}")
         logger.info(f"Starting Claude Code: {' '.join(cmd[:10])}...")
         self._proc = subprocess.Popen(
             cmd,
@@ -206,14 +210,34 @@ class ClaudeBridge:
             cwd=self.cwd,
         )
         self._alive = True
+        logger.debug(f"[{self.session_id[:8]}] 进程已启动, pid={self._proc.pid}")
 
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
+
+    def _kill_stale_processes(self):
+        """杀掉同一个 session_id 的残留进程"""
+        import signal
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", f"--session-id {self.session_id}|--resume {self.session_id}"],
+                capture_output=True, text=True, timeout=3,
+            )
+            pids = [int(p) for p in result.stdout.strip().split("\n") if p.strip()]
+            for pid in pids:
+                logger.warning(f"[{self.session_id[:8]}] 杀掉残留进程 pid={pid}")
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+        except Exception:
+            pass
 
     def stop(self):
         self._alive = False
         if self._proc:
             pid = self._proc.pid
+            logger.debug(f"[{self.session_id[:8]}] stop() 开始, pid={pid}")
             # 先关 stdin 让进程自然退出
             try:
                 self._proc.stdin.close()
@@ -221,8 +245,10 @@ class ClaudeBridge:
                 pass
             try:
                 self._proc.wait(timeout=5)
+                logger.debug(f"[{self.session_id[:8]}] 进程 {pid} 正常退出")
             except:
                 # 超时 → 强制杀
+                logger.debug(f"[{self.session_id[:8]}] 进程 {pid} 未响应, 强制 kill")
                 try:
                     self._proc.kill()
                     self._proc.wait(timeout=3)
@@ -234,7 +260,10 @@ class ClaudeBridge:
                 os.kill(pid, signal.SIGKILL)
             except (OSError, ProcessLookupError):
                 pass  # 已经退出了
+            logger.debug(f"[{self.session_id[:8]}] stop() 完成, pid={pid}")
             self._proc = None
+        else:
+            logger.debug(f"[{self.session_id[:8]}] stop() 无进程需要停止")
 
     @property
     def is_alive(self) -> bool:
@@ -277,6 +306,8 @@ class ClaudeBridge:
 
     def _on_turn_done(self):
         """turn 完成后，检查 MCP 热加载，合并投递 pending 消息"""
+        pid = self._proc.pid if self._proc else "?"
+        logger.debug(f"[{self.session_id[:8]}] _on_turn_done, pid={pid}, pending={self._pending.qsize()}")
         # 先发回复
         full_response = "\n".join(self._current_response_parts)
         if full_response:
