@@ -6,7 +6,6 @@ Claude Code Bridge — 通过 stream-json 协议与 Claude Code 进程通信
 import subprocess
 import json
 import threading
-import queue
 import uuid
 import logging
 import os
@@ -32,8 +31,8 @@ class ClaudeBridge:
 
     核心行为：
     - Claude 空闲时，消息直接发送
-    - Claude 在忙时，消息入 pending 队列
-    - 当前 turn 完成后，所有 pending 消息合并为一条发送
+    - Claude 在忙时，新消息直接写入 stdin，由 Claude Code 的 interrupt 机制处理
+    - Claude Code 会将新消息作为 system-reminder 注入当前 turn 上下文
     """
 
     def __init__(
@@ -54,14 +53,12 @@ class ClaudeBridge:
         self.on_tool_use = on_tool_use  # (tool_name, input) → 工具反馈
         self.cwd = cwd or os.getcwd()
 
-        self._pending = queue.Queue()
         self._is_busy = False
         self._lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
         self._alive = False
         self._resume = resume
         self._current_response_parts: list[str] = []
-        self._deferred_response: str = ""  # pending 时暂存的回复
 
         # MCP 配置 (平台无关)
         self._mcp_env = mcp_env  # {"platform": "telegram"|"feishu", ...平台参数}
@@ -274,14 +271,21 @@ class ClaudeBridge:
 
     def send(self, text: str):
         """
-        发送消息。如果 Claude 在忙，自动入队。
+        发送消息。直接写入 stdin，让 Claude Code 内部的 interrupt 机制处理。
+        不管 Claude 是否在忙，都直接写入：
+        - 空闲时：触发新的 turn
+        - 忙碌时：Claude Code 会将其作为 system-reminder 注入当前 turn
         """
-        with self._lock:
-            if self._is_busy:
-                self._pending.put(text)
-                logger.info(f"[{self.session_id[:8]}] 消息入队 (队列: {self._pending.qsize()})")
-            else:
-                self._send_direct(text)
+        if not self._proc or not self.is_alive:
+            logger.error(f"[{self.session_id[:8]}] 进程未运行，无法发送")
+            return
+        try:
+            self._proc.stdin.write(_make_msg(text))
+            self._proc.stdin.flush()
+            busy_tag = " (interrupt)" if self._is_busy else ""
+            logger.info(f"[{self.session_id[:8]}] → Claude{busy_tag}: {text[:80]}")
+        except (BrokenPipeError, OSError) as e:
+            logger.error(f"[{self.session_id[:8]}] 写入失败: {e}")
 
     def _set_busy(self, busy: bool):
         self._is_busy = busy
@@ -291,44 +295,19 @@ class ClaudeBridge:
             except Exception as e:
                 logger.debug(f"on_busy_changed error: {e}")
 
-    def _send_direct(self, text: str):
-        if not self._proc or not self.is_alive:
-            logger.error(f"[{self.session_id[:8]}] 进程未运行，无法发送")
-            return
-        self._set_busy(True)
-        self._current_response_parts = []
-        try:
-            self._proc.stdin.write(_make_msg(text))
-            self._proc.stdin.flush()
-            logger.info(f"[{self.session_id[:8]}] → Claude: {text[:80]}")
-        except (BrokenPipeError, OSError) as e:
-            logger.error(f"[{self.session_id[:8]}] 写入失败: {e}")
-            self._set_busy(False)
-
     def _on_turn_done(self):
-        """turn 完成后，检查 MCP 热加载，合并投递 pending 消息"""
+        """turn 完成后，发送回复，检查 MCP 热加载"""
         pid = self._proc.pid if self._proc else "?"
-        pending_count = self._pending.qsize()
-        logger.debug(f"[{self.session_id[:8]}] _on_turn_done, pid={pid}, pending={pending_count}")
+        logger.debug(f"[{self.session_id[:8]}] _on_turn_done, pid={pid}")
 
         full_response = "\n".join(self._current_response_parts)
+        self._current_response_parts = []
 
-        if pending_count > 0:
-            # 有 pending 消息 → 暂存回复，等 pending 处理完再一起发
-            logger.debug(f"[{self.session_id[:8]}] 有 {pending_count} 条 pending，暂存回复")
-            self._deferred_response = full_response
-        else:
-            # 没有 pending → 直接发回复（包括之前暂存的）
-            if hasattr(self, '_deferred_response') and self._deferred_response:
-                combined = self._deferred_response + "\n\n" + full_response if full_response else self._deferred_response
-                self._deferred_response = ""
-                full_response = combined
-
-            if full_response:
-                try:
-                    self.on_response(full_response)
-                except Exception as e:
-                    logger.error(f"on_response callback error: {e}")
+        if full_response:
+            try:
+                self.on_response(full_response)
+            except Exception as e:
+                logger.error(f"on_response callback error: {e}")
 
         if self.on_turn_complete:
             try:
@@ -336,30 +315,15 @@ class ClaudeBridge:
             except:
                 pass
 
-        # 检查自定义 MCP 是否有变化
+        # 检查 MCP 是否有变化
         if self._check_mcp_changed():
             self._needs_reload = True
 
         with self._lock:
             self._set_busy(False)
 
-            # 需要重启加载新 MCP → 在发下一条消息前重启
             if self._needs_reload:
                 self._reload()
-
-            pending_msgs = []
-            while not self._pending.empty():
-                pending_msgs.append(self._pending.get())
-
-            if pending_msgs:
-                if len(pending_msgs) == 1:
-                    merged = pending_msgs[0]
-                else:
-                    merged = "以下是用户在你处理期间发的多条消息，请一并处理：\n\n"
-                    for i, msg in enumerate(pending_msgs, 1):
-                        merged += f"{i}. {msg}\n"
-                logger.info(f"[{self.session_id[:8]}] 合并 {len(pending_msgs)} 条 pending")
-                self._send_direct(merged)
 
     def _read_stdout(self):
         try:
@@ -517,7 +481,6 @@ class SessionManager:
                     "session_id": bridge.session_id,
                     "alive": bridge.is_alive,
                     "busy": bridge._is_busy,
-                    "pending": bridge._pending.qsize(),
                     "cwd": bridge.cwd,
                 })
             return result

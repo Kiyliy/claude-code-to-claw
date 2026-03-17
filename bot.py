@@ -285,7 +285,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Session: {bridge.session_id[:8]}...\n"
             f"Full ID: {bridge.session_id}\n"
             f"状态: {'处理中' if bridge._is_busy else '空闲'}\n"
-            f"队列: {bridge._pending.qsize()} 条待处理\n"
             f"工作目录: {bridge.cwd}"
         )
     else:
@@ -397,11 +396,10 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [f"活跃 sessions ({len(active)}):\n"]
         for s in active:
             status = "处理中" if s["busy"] else "空闲"
-            pending = f" +{s['pending']}待处理" if s["pending"] else ""
             lines.append(
                 f"• {s['key']}\n"
                 f"  ID: {s['session_id'][:8]}... "
-                f"[{status}{pending}]"
+                f"[{status}]"
             )
         text = "\n".join(lines)
     await context.bot.send_message(**reply_kwargs, text=text)

@@ -139,7 +139,6 @@ def _handle_command(cmd: str, args: str, chat_id: str, session_key: str):
                 f"Session: {bridge.session_id[:8]}...\n"
                 f"Full ID: {bridge.session_id}\n"
                 f"状态: {'处理中' if bridge._is_busy else '空闲'}\n"
-                f"队列: {bridge._pending.qsize()} 条待处理\n"
                 f"工作目录: {bridge.cwd}"
             )
         else:
@@ -155,8 +154,7 @@ def _handle_command(cmd: str, args: str, chat_id: str, session_key: str):
             lines = [f"活跃 sessions ({len(active)}):"]
             for s in active:
                 status = "处理中" if s["busy"] else "空闲"
-                pending = f" +{s['pending']}待处理" if s["pending"] else ""
-                lines.append(f"\n• {s['key']}\n  ID: {s['session_id'][:8]}... [{status}{pending}]")
+                lines.append(f"\n• {s['key']}\n  ID: {s['session_id'][:8]}... [{status}]")
             _feishu_send(chat_id, "\n".join(lines))
         return True
 
