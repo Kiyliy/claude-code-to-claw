@@ -61,6 +61,7 @@ class ClaudeBridge:
         self._alive = False
         self._resume = resume
         self._current_response_parts: list[str] = []
+        self._deferred_response: str = ""  # pending 时暂存的回复
 
         # MCP 配置 (平台无关)
         self._mcp_env = mcp_env  # {"platform": "telegram"|"feishu", ...平台参数}
@@ -307,14 +308,27 @@ class ClaudeBridge:
     def _on_turn_done(self):
         """turn 完成后，检查 MCP 热加载，合并投递 pending 消息"""
         pid = self._proc.pid if self._proc else "?"
-        logger.debug(f"[{self.session_id[:8]}] _on_turn_done, pid={pid}, pending={self._pending.qsize()}")
-        # 先发回复
+        pending_count = self._pending.qsize()
+        logger.debug(f"[{self.session_id[:8]}] _on_turn_done, pid={pid}, pending={pending_count}")
+
         full_response = "\n".join(self._current_response_parts)
-        if full_response:
-            try:
-                self.on_response(full_response)
-            except Exception as e:
-                logger.error(f"on_response callback error: {e}")
+
+        if pending_count > 0:
+            # 有 pending 消息 → 暂存回复，等 pending 处理完再一起发
+            logger.debug(f"[{self.session_id[:8]}] 有 {pending_count} 条 pending，暂存回复")
+            self._deferred_response = full_response
+        else:
+            # 没有 pending → 直接发回复（包括之前暂存的）
+            if hasattr(self, '_deferred_response') and self._deferred_response:
+                combined = self._deferred_response + "\n\n" + full_response if full_response else self._deferred_response
+                self._deferred_response = ""
+                full_response = combined
+
+            if full_response:
+                try:
+                    self.on_response(full_response)
+                except Exception as e:
+                    logger.error(f"on_response callback error: {e}")
 
         if self.on_turn_complete:
             try:
