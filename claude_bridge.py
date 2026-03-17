@@ -213,14 +213,27 @@ class ClaudeBridge:
     def stop(self):
         self._alive = False
         if self._proc:
+            pid = self._proc.pid
+            # 先关 stdin 让进程自然退出
             try:
                 self._proc.stdin.close()
             except:
                 pass
             try:
-                self._proc.wait(timeout=10)
+                self._proc.wait(timeout=5)
             except:
-                self._proc.kill()
+                # 超时 → 强制杀
+                try:
+                    self._proc.kill()
+                    self._proc.wait(timeout=3)
+                except:
+                    pass
+            # 确保进程真的死了
+            try:
+                import signal
+                os.kill(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass  # 已经退出了
             self._proc = None
 
     @property
