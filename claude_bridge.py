@@ -18,10 +18,14 @@ CLAUDE_SETTINGS_FILE = os.path.expanduser("~/.claude/settings.json")
 RELOAD_SIGNAL_FILE = os.path.expanduser("~/.claude/claw_reload_signal")
 
 
-def _make_msg(text: str) -> bytes:
+def _make_msg(text: str, priority: str = "next") -> bytes:
+    """构造 stream-json 格式的用户消息。
+    priority: "now" (立刻中断), "next" (工具间隙注入, 默认), "later" (所有工具完成后)
+    """
     return (json.dumps({
         "type": "user",
-        "message": {"role": "user", "content": text}
+        "message": {"role": "user", "content": text},
+        "priority": priority,
     }, ensure_ascii=False) + "\n").encode("utf-8")
 
 
@@ -121,7 +125,7 @@ class ClaudeBridge:
             if reason:
                 wake_msg += f" 重启原因: {reason}。"
             wake_msg += " 请继续之前的任务。"
-            self._send_direct(wake_msg)
+            self.send(wake_msg)
         else:
             logger.error(f"[{self.session_id[:8]}] 重启失败")
 
