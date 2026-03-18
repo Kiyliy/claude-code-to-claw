@@ -12,7 +12,8 @@ import time
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
+from telegramify_markdown import markdownify
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -183,9 +184,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i in range(0, len(response_text), 4000):
                 chunk = response_text[i:i + 4000]
                 try:
-                    await bot.send_message(**reply_kwargs, text=chunk)
-                except Exception as e:
-                    logger.error(f"发送失败: {e}")
+                    md_text = markdownify(chunk)
+                    await bot.send_message(**reply_kwargs, text=md_text, parse_mode=ParseMode.MARKDOWN_V2)
+                except Exception:
+                    # MarkdownV2 解析失败 → fallback 纯文本
+                    try:
+                        await bot.send_message(**reply_kwargs, text=chunk)
+                    except Exception as e:
+                        logger.error(f"发送失败: {e}")
         asyncio.run_coroutine_threadsafe(_send(), loop)
 
     def on_busy_changed(is_busy: bool):
@@ -349,9 +355,13 @@ async def cmd_attach(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i in range(0, len(response_text), 4000):
                 chunk = response_text[i:i + 4000]
                 try:
-                    await context.bot.send_message(**reply_kwargs, text=chunk)
-                except Exception as e:
-                    logger.error(f"发送失败: {e}")
+                    md_text = markdownify(chunk)
+                    await context.bot.send_message(**reply_kwargs, text=md_text, parse_mode=ParseMode.MARKDOWN_V2)
+                except Exception:
+                    try:
+                        await context.bot.send_message(**reply_kwargs, text=chunk)
+                    except Exception as e:
+                        logger.error(f"发送失败: {e}")
         asyncio.run_coroutine_threadsafe(_send(), loop)
 
     try:
@@ -434,13 +444,18 @@ async def post_init(application):
 
         def on_response(response_text: str):
             async def _send():
-                kwargs = {"chat_id": int(job.chat_id), "text": f"⏰ {response_text[:3900]}"}
+                text = f"⏰ {response_text[:3900]}"
+                kwargs = {"chat_id": int(job.chat_id)}
                 if job.topic_id:
                     kwargs["message_thread_id"] = int(job.topic_id)
                 try:
-                    await _bot_instance.send_message(**kwargs)
-                except Exception as e:
-                    logger.error(f"Job response send failed: {e}")
+                    md_text = markdownify(text)
+                    await _bot_instance.send_message(**kwargs, text=md_text, parse_mode=ParseMode.MARKDOWN_V2)
+                except Exception:
+                    try:
+                        await _bot_instance.send_message(**kwargs, text=text)
+                    except Exception as e:
+                        logger.error(f"Job response send failed: {e}")
             asyncio.run_coroutine_threadsafe(_send(), loop)
 
         try:
