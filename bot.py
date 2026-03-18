@@ -151,9 +151,51 @@ def _tool_summary(name: str, input_data: dict) -> str:
         return name
 
 
+async def _download_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """如果消息包含文件/图片/语音，下载到 workspace/ 并返回路径"""
+    msg = update.message
+    file_obj = None
+    filename = None
+
+    if msg.document:
+        file_obj = msg.document
+        filename = msg.document.file_name or f"doc_{msg.document.file_unique_id}"
+    elif msg.photo:
+        file_obj = msg.photo[-1]  # 最大尺寸
+        filename = f"photo_{file_obj.file_unique_id}.jpg"
+    elif msg.voice:
+        file_obj = msg.voice
+        filename = f"voice_{file_obj.file_unique_id}.ogg"
+    elif msg.audio:
+        file_obj = msg.audio
+        filename = msg.audio.file_name or f"audio_{file_obj.file_unique_id}"
+    elif msg.video:
+        file_obj = msg.video
+        filename = msg.video.file_name or f"video_{file_obj.file_unique_id}.mp4"
+
+    if not file_obj:
+        return None
+
+    workspace = os.path.join(WORK_DIR, "workspace")
+    os.makedirs(workspace, exist_ok=True)
+    filepath = os.path.join(workspace, filename)
+
+    tg_file = await context.bot.get_file(file_obj.file_id)
+    await tg_file.download_to_drive(filepath)
+    logger.info(f"文件已下载: {filepath}")
+    return filepath
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理用户消息"""
-    text = _extract_text(update)
+    """处理用户消息（文本 + 文件）"""
+    text = _extract_text(update) or ""
+
+    # 下载附件
+    file_path = await _download_file(update, context)
+    if file_path:
+        file_notice = f"[用户发送了文件，已保存到: {file_path}]"
+        text = f"{file_notice}\n{text}" if text else file_notice
+
     if not text:
         return
 
@@ -492,7 +534,11 @@ def main():
     app.add_handler(CommandHandler("detach", cmd_detach))
     app.add_handler(CommandHandler("sessions", cmd_sessions))
     app.add_handler(CommandHandler("verbose", cmd_verbose))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.Document.ALL | filters.PHOTO | filters.VOICE | filters.AUDIO | filters.VIDEO)
+        & ~filters.COMMAND,
+        handle_message,
+    ))
 
     logger.info("Bot 已就绪，开始 polling...")
     app.run_polling(drop_pending_updates=True)
