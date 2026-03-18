@@ -283,10 +283,13 @@ class ClaudeBridge:
         if not self._proc or not self.is_alive:
             logger.error(f"[{self.session_id[:8]}] 进程未运行，无法发送")
             return
+        was_busy = self._is_busy
+        if not self._is_busy:
+            self._set_busy(True)
         try:
             self._proc.stdin.write(_make_msg(text))
             self._proc.stdin.flush()
-            busy_tag = " (interrupt)" if self._is_busy else ""
+            busy_tag = " (interrupt)" if was_busy else ""
             logger.info(f"[{self.session_id[:8]}] → Claude{busy_tag}: {text[:80]}")
         except (BrokenPipeError, OSError) as e:
             logger.error(f"[{self.session_id[:8]}] 写入失败: {e}")
