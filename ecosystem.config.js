@@ -1,12 +1,14 @@
+// PM2 config. Secrets are read from the environment (e.g. a .env loaded by your shell
+// or `pm2 start ecosystem.config.js --update-env`); never commit real values here.
 module.exports = {
   apps: [
     {
       name: "claw-telegram",
       script: "bot.py",
       interpreter: "python3",
-      cwd: "/root/kimi_dev/claude-code-to-claw",
+      cwd: __dirname,
       env: {
-        TELEGRAM_BOT_TOKEN: "8762099138:AAFw11rUOBNY8zZdn2QWHAJ-szrfn2INxYI",
+        TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
       },
       max_restarts: 10,
       restart_delay: 5000,
@@ -16,10 +18,10 @@ module.exports = {
       name: "claw-feishu",
       script: "bot_feishu.py",
       interpreter: "python3",
-      cwd: "/root/kimi_dev/claude-code-to-claw",
+      cwd: __dirname,
       env: {
-        FEISHU_APP_ID: "cli_a9338154fc38dbc6",
-        FEISHU_APP_SECRET: "7eVe50nbx3IWznerfyKRBbrgPpWl1QV3",
+        FEISHU_APP_ID: process.env.FEISHU_APP_ID,
+        FEISHU_APP_SECRET: process.env.FEISHU_APP_SECRET,
       },
       max_restarts: 10,
       restart_delay: 5000,

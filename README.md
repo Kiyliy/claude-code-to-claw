@@ -1,6 +1,12 @@
 # 🦀 Claude Code to Claw
 
-> Turn Claude Code into a 24/7 autonomous AI assistant on Telegram.
+> Turn Claude Code into a 24/7 autonomous AI assistant on Telegram and Feishu.
+
+![python](https://img.shields.io/badge/Python-3-3776AB?logo=python&logoColor=white)
+![telegram](https://img.shields.io/badge/Telegram-bot-26A5E4?logo=telegram&logoColor=white)
+![feishu](https://img.shields.io/badge/Feishu-bot-00D6B9)
+![claude code](https://img.shields.io/badge/Claude_Code-stream--json-D97757)
+![license](https://img.shields.io/badge/license-MIT-blue)
 
 Bridge your local [Claude Code](https://claude.ai/code) to Telegram with **pending message queue**, **cron jobs**, and **proactive messaging** via MCP.
 
@@ -62,6 +68,9 @@ cp .env.example .env
 
 # Run (in your project directory)
 CLAUDE_WORK_DIR=/path/to/your/project python bot.py
+
+# Or keep both bots alive with PM2 (reads secrets from your environment)
+pm2 start ecosystem.config.js
 ```
 
 ---
@@ -109,9 +118,11 @@ Telegram ←→ Bot Server ←→ Claude Code Process
 | `TELEGRAM_BOT_TOKEN` | Yes | Telegram Bot API token |
 | `CLAUDE_WORK_DIR` | No | Working directory for Claude Code (default: cwd) |
 | `CLAW_CRON_FILE` | No | Cron jobs persistence file (default: `~/.claude/claw_crons.json`) |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | For Feishu | Feishu (Lark) app credentials, used by `bot_feishu.py` |
+| `FEISHU_WEBHOOK_URL` | No | Feishu webhook for push-only notifications |
 
 ---
 
 ## 📜 License
 
-MIT
+[MIT](LICENSE)
